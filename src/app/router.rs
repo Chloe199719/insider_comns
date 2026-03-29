@@ -2,21 +2,27 @@ use axum::{
     Router,
     body::Bytes,
     extract::{MatchedPath, Request},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderName},
     response::Response,
     routing::get,
 };
 use std::time::Duration;
 
-use tower_http::classify::ServerErrorsFailureClass;
+use tower_http::{
+    classify::ServerErrorsFailureClass,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+};
 use tracing::{Span, info_span, instrument};
-
+const REQUEST_ID_HEADER: &str = "x-request-id";
 use crate::app::state::AppState;
 
 pub async fn create_router(state: AppState) -> Router {
+    let x_request_id = HeaderName::from_static(REQUEST_ID_HEADER);
+
+    // Layer order (last .layer() = outermost, runs first on the request): outer handlers must
+    // set `x-request-id` before TraceLayer's span is built, or `make_span_with` sees no header.
     let router = Router::new()
         .route("/health", get(health_check))
-        .layer(tower_http::cors::CorsLayer::permissive())
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
@@ -26,9 +32,14 @@ pub async fn create_router(state: AppState) -> Router {
                         .extensions()
                         .get::<MatchedPath>()
                         .map(MatchedPath::as_str);
+                    let request_id = match request.headers().get(REQUEST_ID_HEADER) {
+                        Some(request_id) => request_id.to_str().unwrap(),
+                        None => "unknown",
+                    };
 
                     info_span!(
                         "http_request",
+                        request_id,
                         method = ?request.method(),
                         matched_path,
                         request_uri = tracing::field::Empty,
@@ -67,18 +78,12 @@ pub async fn create_router(state: AppState) -> Router {
                     let latency_ms: u64 = latency.as_millis().try_into().unwrap_or(u64::MAX);
                     span.record("last_chunk_len", chunk.len() as u64);
                     span.record("chunk_latency_ms", latency_ms);
-                    tracing::debug!(
-                        chunk_len = chunk.len(),
-                        latency_ms,
-                        "body chunk"
-                    );
+                    tracing::debug!(chunk_len = chunk.len(), latency_ms, "body chunk");
                 })
                 .on_eos(
                     |trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
-                        let duration_ms: u64 = stream_duration
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX);
+                        let duration_ms: u64 =
+                            stream_duration.as_millis().try_into().unwrap_or(u64::MAX);
                         span.record("stream_duration_ms", duration_ms);
                         span.record("has_trailers", trailers.is_some());
                         tracing::info!(
@@ -88,13 +93,21 @@ pub async fn create_router(state: AppState) -> Router {
                         );
                     },
                 )
-                .on_failure(|error: ServerErrorsFailureClass, latency: Duration, span: &Span| {
-                    let latency_ms: u64 = latency.as_millis().try_into().unwrap_or(u64::MAX);
-                    span.record("failure_class", tracing::field::debug(&error));
-                    span.record("failure_latency_ms", latency_ms);
-                    tracing::warn!(?error, latency_ms, "request failed");
-                }),
+                .on_failure(
+                    |error: ServerErrorsFailureClass, latency: Duration, span: &Span| {
+                        let latency_ms: u64 = latency.as_millis().try_into().unwrap_or(u64::MAX);
+                        span.record("failure_class", tracing::field::debug(&error));
+                        span.record("failure_latency_ms", latency_ms);
+                        tracing::warn!(?error, latency_ms, "request failed");
+                    },
+                ),
         )
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(SetRequestIdLayer::new(
+            x_request_id.clone(),
+            MakeRequestUuid,
+        ))
+        .layer(PropagateRequestIdLayer::new(x_request_id))
         .with_state(state);
     router
 }
