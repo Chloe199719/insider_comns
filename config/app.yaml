@@ -1,0 +1,11 @@
+
+host: "127.0.0.1"
+port: 8080
+base_url: "http://127.0.0.1:8080"
+jwt_access_expiry_secs: 900         # 15 minutes
+jwt_refresh_expiry_secs: 1209600    # 14 days
+refresh_cookie_name: "refresh_token"
+refresh_cookie_path: "/"
+refresh_cookie_secure: false
+refresh_same_site: Lax
+
